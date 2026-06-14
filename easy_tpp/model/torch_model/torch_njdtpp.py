@@ -6,9 +6,9 @@ marked log-intensity vector directly as a neural jump-diffusion SDE,
 
     d eta_t = f(eta_t) dt + g(eta_t) dW_t + h(eta_t) dN_t,
 
-where eta_t[m] = log lambda_m(t).  EasyTPP already owns batching, masking,
-negative log-likelihood aggregation, and thinning-based prediction, so this
-file focuses on producing marked intensities at event and sampled times.
+where eta_t[m] = log lambda_m(t).  EasyTPP already owns batching, masking, and
+negative log-likelihood aggregation, so this file focuses on producing marked
+intensities at event and sampled times.
 
 Common hyperparameter ranges reported or used by the paper/released code:
     - ``hidden_size`` / ``model_specs.hidden_size``: 16, 32, 64.
@@ -25,7 +25,7 @@ Common hyperparameter ranges reported or used by the paper/released code:
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -129,8 +129,10 @@ class NJDTPP(TorchBaseModel):
         # Euler-Maruyama substeps.  The public NJDTPP code calls this
         # ``num_divide`` and uses 10 for real-world experiments.
         self.num_sde_steps = int(specs.get("num_sde_steps", 10))
+        self.num_prediction_samples = int(specs.get("num_prediction_samples", 1000))
         self.diffusion_scale = float(specs.get("diffusion_scale", 1.0))
         self.log_intensity_clip = float(specs.get("log_intensity_clip", 20.0))
+        self.eta0_learning_rate = float(specs.get("eta0_learning_rate", 1.0e-1))
         # eta0 is learned directly, as in the released NJDTPP implementation.
         eta0_mean = float(specs.get("eta0_init_mean", 0.0))
         eta0_std = float(specs.get("eta0_init_std", 0.1))
@@ -263,6 +265,46 @@ class NJDTPP(TorchBaseModel):
             eta_state = self._euler_maruyama_step(eta_state, step_dt)
         return eta_state
 
+    def _make_fixed_grid_dtimes(
+        self,
+        delta_time: torch.Tensor,
+        num_steps: int,
+    ) -> torch.Tensor:
+        """Return the fixed Euler grid used to record one SDE path."""
+        solver_steps = max(int(num_steps), 1)
+        ratios = torch.linspace(
+            start=0.0,
+            end=1.0,
+            steps=solver_steps + 1,
+            device=delta_time.device,
+            dtype=delta_time.dtype,
+        )
+        return delta_time.clamp_min(0.0).unsqueeze(-1) * ratios
+
+    def _solve_fixed_grid_path(
+        self,
+        eta_initial: torch.Tensor,
+        delta_time: torch.Tensor,
+        num_steps: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Advance one Euler-Maruyama path and record every grid state.
+
+        The official NJDTPP ``EulerSolver`` samples one Brownian trajectory per
+        interval, records the initial state, then records each fixed Euler step.
+        This helper mirrors that contract and avoids adding stochastic steps at
+        arbitrary query/sample times.
+        """
+        solver_steps = max(int(num_steps or self.num_sde_steps), 1)
+        eta_state = eta_initial
+        step_dt = (delta_time.clamp_min(0.0) / solver_steps).unsqueeze(-1)
+        path_states = [eta_state]
+
+        for _ in range(solver_steps):
+            eta_state = self._euler_maruyama_step(eta_state, step_dt)
+            path_states.append(eta_state)
+
+        return torch.stack(path_states, dim=-2)
+
     def _make_loglike_sample_dtimes(
         self,
         time_delta_seq: torch.Tensor,
@@ -271,36 +313,32 @@ class NJDTPP(TorchBaseModel):
 
         The released ``Zh-Shuai/NJDTPP`` code evaluates the likelihood integral
         on the ``EulerSolver`` trajectory, which records ``num_divide + 1``
-        states per interval.  For deterministic trapezoid integration we mirror
-        that decision with ``num_sde_steps + 1`` points.  If EasyTPP Monte Carlo
-        sampling is explicitly enabled, we keep its random samples but still
-        evolve them along one shared interval path.
+        states per interval. For trapezoid integration we mirror that decision
+        with ``num_sde_steps + 1`` points. If EasyTPP's configured loss samples
+        are explicitly enabled, we still evolve them along one shared interval
+        path.
         """
         if self.use_mc_samples:
-            return self.make_dtime_loss_samples(time_delta_seq)
-
-        ratios = torch.linspace(
-            start=0.0,
-            end=1.0,
-            steps=max(self.num_sde_steps, 1) + 1,
-            device=self.device,
-        )
-        return time_delta_seq[:, :, None] * ratios[None, None, :]
+            num_steps = max(self.loss_integral_num_sample_per_step - 1, 1)
+        else:
+            num_steps = max(self.num_sde_steps, 1)
+        return self._make_fixed_grid_dtimes(time_delta_seq, num_steps)
 
     def _solve_path_at_sorted_times(
         self,
         eta_initial: torch.Tensor,
         sorted_dtimes: torch.Tensor,
         final_dtime: Optional[torch.Tensor] = None,
+        num_steps: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Advance one interval path and record states at sorted offsets.
+        """Advance one fixed-grid interval path and read states at sorted offsets.
 
         Zhang et al. (ICML 2024, Eq. 18-21) define the marked log-intensity as
         a neural jump-diffusion SDE and use Euler-Maruyama trajectories for the
         likelihood integral.  The official ``Zh-Shuai/NJDTPP`` implementation's
         ``EulerSolver`` similarly records states along one path per interval.
-        This helper keeps sampled intensities on a shared path instead of
-        independently resampling Brownian noise for every queried offset.
+        This helper keeps queried intensities on a shared fixed Euler path
+        instead of inserting extra Brownian increments at every query offset.
 
         Args:
             eta_initial: Right-limit states at interval starts, shape ``[..., M]``.
@@ -313,7 +351,7 @@ class NJDTPP(TorchBaseModel):
             Pair of sampled states ``[..., num_samples, M]`` and optional final
             state ``[..., M]``.
         """
-        solver_steps = max(self.num_sde_steps, 1)
+        solver_steps = max(int(num_steps or max(sorted_dtimes.size(-1) - 1, 1)), 1)
         num_samples = sorted_dtimes.size(-1)
         original_shape = eta_initial.shape[:-1]
 
@@ -324,60 +362,28 @@ class NJDTPP(TorchBaseModel):
         else:
             flat_final_time = final_dtime.reshape(-1).clamp_min(0.0)
 
-        num_paths = flat_eta.size(0)
-        flat_sampled_states = flat_eta.new_zeros(
-            num_paths,
-            num_samples,
+        flat_grid_states = self._solve_fixed_grid_path(
+            eta_initial=flat_eta,
+            delta_time=flat_final_time,
+            num_steps=solver_steps,
+        )
+        safe_final_time = flat_final_time[:, None].clamp_min(torch.finfo(flat_eta.dtype).eps)
+        clamped_samples = torch.minimum(flat_samples, flat_final_time[:, None])
+        sample_ratios = torch.where(
+            flat_final_time[:, None] > 0.0,
+            clamped_samples / safe_final_time,
+            torch.zeros_like(clamped_samples),
+        )
+        nearest_grid_index = (sample_ratios * solver_steps).round().long().clamp(
+            min=0,
+            max=solver_steps,
+        )
+        gather_index = nearest_grid_index.unsqueeze(-1).expand(
+            -1,
+            -1,
             self.num_event_types,
         )
-        current_time = flat_eta.new_zeros(num_paths)
-        sample_cursor = torch.zeros(num_paths, dtype=torch.long, device=flat_eta.device)
-        boundary_cursor = torch.ones(num_paths, dtype=torch.long, device=flat_eta.device)
-        inf_time = torch.full_like(current_time, float("inf"))
-
-        # Walk each path through the union of requested samples and the fixed
-        # Euler grid.  This preserves one Brownian trajectory per interval while
-        # making ``num_sde_steps`` affect both event states and integral samples.
-        while True:
-            need_sample = sample_cursor < num_samples
-            need_boundary = boundary_cursor <= solver_steps
-            active = need_sample | need_boundary
-            if not active.any():
-                break
-
-            safe_sample_cursor = sample_cursor.clamp(max=num_samples - 1)
-            next_sample_time = flat_samples.gather(
-                dim=1,
-                index=safe_sample_cursor[:, None],
-            ).squeeze(1)
-            next_sample_time = torch.where(need_sample, next_sample_time, inf_time)
-
-            next_boundary_time = flat_final_time * boundary_cursor.to(
-                flat_eta.dtype,
-            ) / solver_steps
-            next_boundary_time = torch.where(
-                need_boundary,
-                next_boundary_time,
-                inf_time,
-            )
-
-            next_time = torch.minimum(next_sample_time, next_boundary_time)
-            next_time = torch.where(active, next_time, current_time)
-            step_dt = (next_time - current_time).clamp_min(0.0).unsqueeze(-1)
-            flat_eta = self._euler_maruyama_step(flat_eta, step_dt)
-            current_time = next_time
-
-            hit_sample = active & need_sample & (next_sample_time <= next_boundary_time)
-            if hit_sample.any():
-                rows = torch.nonzero(hit_sample, as_tuple=False).squeeze(-1)
-                cols = sample_cursor[rows]
-                flat_sampled_states[rows, cols, :] = flat_eta[rows]
-                sample_cursor = sample_cursor + hit_sample.to(sample_cursor.dtype)
-
-            hit_boundary = active & need_boundary & (
-                next_boundary_time <= next_sample_time
-            )
-            boundary_cursor = boundary_cursor + hit_boundary.to(boundary_cursor.dtype)
+        flat_sampled_states = flat_grid_states.gather(dim=1, index=gather_index)
 
         sampled_states = flat_sampled_states.view(
             *original_shape,
@@ -386,7 +392,10 @@ class NJDTPP(TorchBaseModel):
         )
         final_state = None
         if final_dtime is not None:
-            final_state = flat_eta.view(*original_shape, self.num_event_types)
+            final_state = flat_grid_states[:, -1, :].view(
+                *original_shape,
+                self.num_event_types,
+            )
 
         return sampled_states, final_state
 
@@ -394,12 +403,14 @@ class NJDTPP(TorchBaseModel):
         self,
         eta_initial: torch.Tensor,
         sample_dtimes: torch.Tensor,
+        num_steps: Optional[int] = None,
     ) -> torch.Tensor:
         """Advance each interval to many sampled offsets on a shared path."""
         sorted_dtimes, sort_indices = sample_dtimes.clamp_min(0.0).sort(dim=-1)
         sorted_states, _ = self._solve_path_at_sorted_times(
             eta_initial=eta_initial,
             sorted_dtimes=sorted_dtimes,
+            num_steps=num_steps,
         )
         inverse_indices = sort_indices.argsort(dim=-1)
         gather_index = inverse_indices.unsqueeze(-1).expand(
@@ -425,34 +436,34 @@ class NJDTPP(TorchBaseModel):
         batch_size, seq_len = time_delta_seqs.shape
 
         eta_left = self.eta0.unsqueeze(0).expand(batch_size, -1)
-        first_event_mask = seq_mask[:, 0] & (type_seqs[:, 0] < self.num_event_types)
+        first_event_mask = (
+            seq_mask[:, 0].bool()
+            & (type_seqs[:, 0] >= 0)
+            & (type_seqs[:, 0] < self.num_event_types)
+        )
         eta_right = self._apply_jump(
             eta_left=eta_left,
             event_types=type_seqs[:, 0],
             event_mask=first_event_mask,
         )
 
+        solver_steps = max(sample_dtimes.size(-1) - 1, 1)
         event_left_states = []
         sample_states = []
         for event_index in range(1, seq_len):
-            sorted_dtimes, sort_indices = sample_dtimes[:, event_index - 1, :].sort(
-                dim=-1,
-            )
-            sorted_states, eta_left = self._solve_path_at_sorted_times(
+            interval_states = self._solve_fixed_grid_path(
                 eta_initial=eta_right,
-                sorted_dtimes=sorted_dtimes,
-                final_dtime=time_delta_seqs[:, event_index],
+                delta_time=time_delta_seqs[:, event_index],
+                num_steps=solver_steps,
             )
-            inverse_indices = sort_indices.argsort(dim=-1)
-            gather_index = inverse_indices.unsqueeze(-1).expand(
-                *inverse_indices.shape,
-                self.num_event_types,
-            )
-            sample_states.append(sorted_states.gather(dim=-2, index=gather_index))
+            eta_left = interval_states[:, -1, :]
+            sample_states.append(interval_states)
             event_left_states.append(eta_left)
 
-            event_mask = seq_mask[:, event_index] & (
-                type_seqs[:, event_index] < self.num_event_types
+            event_mask = (
+                seq_mask[:, event_index].bool()
+                & (type_seqs[:, event_index] >= 0)
+                & (type_seqs[:, event_index] < self.num_event_types)
             )
             eta_right = self._apply_jump(
                 eta_left=eta_left,
@@ -461,6 +472,47 @@ class NJDTPP(TorchBaseModel):
             )
 
         return torch.stack(event_left_states, dim=1), torch.stack(sample_states, dim=1)
+
+    def _compute_event_loglike(
+        self,
+        left_states: torch.Tensor,
+        type_seqs: torch.Tensor,
+        seq_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """Compute marked event log-likelihood from NJDTPP log-intensities."""
+        target_types = type_seqs[:, 1:]
+        valid_event_mask = (
+            seq_mask[:, 1:].bool()
+            & (target_types >= 0)
+            & (target_types < self.num_event_types)
+        )
+        safe_types = target_types.clamp(min=0, max=self.num_event_types - 1)
+        event_loglike = self._clamp_eta(left_states).gather(
+            dim=-1,
+            index=safe_types.unsqueeze(-1),
+        ).squeeze(-1)
+        event_loglike = event_loglike * valid_event_mask.to(event_loglike.dtype)
+        return event_loglike, valid_event_mask, int(valid_event_mask.sum().item())
+
+    def _compute_integral_loglike(
+        self,
+        lambda_t_sample: torch.Tensor,
+        sample_dtimes: torch.Tensor,
+        seq_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Integrate total intensity with trapezoid widths from sample times."""
+        total_lambda = lambda_t_sample.sum(dim=-1)
+        sorted_dtimes, sort_indices = sample_dtimes.clamp_min(0.0).sort(dim=-1)
+        sorted_lambda = total_lambda.gather(dim=-1, index=sort_indices)
+        sample_widths = (sorted_dtimes[..., 1:] - sorted_dtimes[..., :-1]).clamp_min(
+            0.0,
+        )
+        interval_integrals = (
+            0.5
+            * (sorted_lambda[..., 1:] + sorted_lambda[..., :-1])
+            * sample_widths
+        ).sum(dim=-1)
+        return interval_integrals * seq_mask.to(interval_integrals.dtype)
 
     def _compute_event_states(
         self,
@@ -491,8 +543,10 @@ class NJDTPP(TorchBaseModel):
                     delta_time=time_delta_seqs[:, event_index],
                 )
 
-            event_mask = seq_mask[:, event_index] & (
-                type_seqs[:, event_index] < self.num_event_types
+            event_mask = (
+                seq_mask[:, event_index].bool()
+                & (type_seqs[:, event_index] >= 0)
+                & (type_seqs[:, event_index] < self.num_event_types)
             )
             eta_right = self._apply_jump(
                 eta_left=eta_left,
@@ -529,18 +583,48 @@ class NJDTPP(TorchBaseModel):
             seq_mask=batch_non_pad_mask,
             sample_dtimes=sample_dtimes,
         )
-        lambda_at_event = torch.exp(self._clamp_eta(left_states))
         lambda_t_sample = torch.exp(self._clamp_eta(sample_states))
 
-        event_ll, non_event_ll, num_events = self.compute_loglikelihood(
-            time_delta_seq=time_delta_seqs[:, 1:],
-            lambda_at_event=lambda_at_event,
-            lambdas_loss_samples=lambda_t_sample,
-            seq_mask=batch_non_pad_mask[:, 1:],
-            type_seq=type_seqs[:, 1:],
+        event_ll, valid_event_mask, num_events = self._compute_event_loglike(
+            left_states=left_states,
+            type_seqs=type_seqs,
+            seq_mask=batch_non_pad_mask,
         )
+        non_event_ll = self._compute_integral_loglike(
+            lambda_t_sample=lambda_t_sample,
+            sample_dtimes=sample_dtimes,
+            seq_mask=batch_non_pad_mask[:, 1:],
+        )
+        non_event_ll = non_event_ll * valid_event_mask.to(non_event_ll.dtype)
         loss = -(event_ll - non_event_ll).sum()
         return loss, num_events
+
+    def get_optimizer_param_groups(
+        self,
+        base_lr: float,
+        weight_decay: float,
+    ) -> List[Dict[str, Any]]:
+        """Return optimizer groups that keep eta0 at a larger learning rate."""
+        eta0_lr = self.eta0_learning_rate
+        eta0_id = id(self.eta0)
+        sde_params = [
+            param for param in self.parameters()
+            if param.requires_grad and id(param) != eta0_id
+        ]
+        return [
+            {
+                "params": sde_params,
+                "lr": base_lr,
+                "weight_decay": weight_decay,
+                "lr_scale": 1.0,
+            },
+            {
+                "params": [self.eta0],
+                "lr": eta0_lr,
+                "weight_decay": weight_decay,
+                "lr_scale": eta0_lr / base_lr if base_lr > 0 else 1.0,
+            },
+        ]
 
     def compute_intensities_at_sample_times(
         self,
@@ -579,8 +663,73 @@ class NJDTPP(TorchBaseModel):
             right_states = right_states[:, -1:, :]
             sample_dtimes = sample_dtimes[:, -1:, :]
 
+        solver_steps = max(sample_dtimes.size(-1) - 1, 1)
         sample_states = self._solve_at_sample_times(
             eta_initial=right_states,
             sample_dtimes=sample_dtimes,
+            num_steps=solver_steps,
         )
         return torch.exp(self._clamp_eta(sample_states))
+
+    def predict_one_step_at_every_event(
+        self,
+        batch: Tuple[torch.Tensor, ...],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Predict the next event after each observed prefix.
+
+        The standard EasyTPP implementation uses thinning, which assumes a
+        deterministic intensity function while estimating an upper bound and
+        then accepting samples.  NJDTPP intensities are stochastic paths, so we
+        follow the released NJDTPP evaluation style instead: integrate the
+        next-event density on one Euler-Maruyama path and predict the mark from
+        the left-limit state at the actual next event time.
+        """
+        _, time_delta_seqs, type_seqs, batch_non_pad_mask, _ = batch
+        left_states, right_states = self._compute_event_states(
+            time_delta_seqs=time_delta_seqs,
+            type_seqs=type_seqs,
+            seq_mask=batch_non_pad_mask,
+        )
+        prefix_right_states = right_states[:, :-1, :]
+        next_left_states = left_states[:, 1:, :]
+
+        horizon_scale = getattr(self.event_sampler, "dtime_max", 5.0)
+        prediction_horizon = torch.max(
+            time_delta_seqs[:, :-1] * horizon_scale,
+            time_delta_seqs[:, :-1] + horizon_scale,
+        )
+        prediction_steps = max(self.num_prediction_samples - 1, 1)
+        sample_dtimes = self._make_fixed_grid_dtimes(
+            prediction_horizon,
+            prediction_steps,
+        )
+        sample_states = self._solve_fixed_grid_path(
+            eta_initial=prefix_right_states,
+            delta_time=prediction_horizon,
+            num_steps=prediction_steps,
+        )
+        total_intensities = torch.exp(self._clamp_eta(sample_states)).sum(dim=-1)
+        sample_widths = sample_dtimes[..., 1:] - sample_dtimes[..., :-1]
+
+        integral_increments = (
+            0.5
+            * (total_intensities[..., 1:] + total_intensities[..., :-1])
+            * sample_widths
+        )
+        cumulative_integral = torch.cat(
+            [
+                total_intensities.new_zeros((*total_intensities.shape[:-1], 1)),
+                integral_increments.cumsum(dim=-1),
+            ],
+            dim=-1,
+        )
+        density = total_intensities * torch.exp(-cumulative_integral)
+        weighted_dtimes = sample_dtimes * density
+        dtimes_pred = (
+            0.5
+            * (weighted_dtimes[..., 1:] + weighted_dtimes[..., :-1])
+            * sample_widths
+        ).sum(dim=-1)
+
+        types_pred = torch.argmax(next_left_states, dim=-1)
+        return dtimes_pred, types_pred
