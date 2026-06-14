@@ -3,7 +3,7 @@
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from easy_tpp.utils import RunnerPhase, set_optimizer, set_device
+from easy_tpp.utils import RunnerPhase, get_lr_scheduler, set_optimizer, set_device
 
 
 class TorchModelWrapper:
@@ -27,6 +27,7 @@ class TorchModelWrapper:
         if self.trainer_config.gpu!=-1:
             torch.cuda.set_device(self.trainer_config.gpu)
         self.device = set_device(self.trainer_config.gpu)
+        self.lr_scheduler = None
 
         self.model.to(self.device)
 
@@ -34,13 +35,35 @@ class TorchModelWrapper:
             # set up optimizer
             optimizer = self.trainer_config.optimizer
             self.learning_rate = self.trainer_config.learning_rate
-            self.opt = set_optimizer(optimizer, self.model.parameters(), self.learning_rate)
+            optimizer_params = self._get_optimizer_params()
+            self.opt = set_optimizer(
+                optimizer,
+                optimizer_params,
+                self.learning_rate,
+                weight_decay=self.trainer_config.weight_decay,
+            )
 
         # set up tensorboard
         self.train_summary_writer, self.valid_summary_writer = None, None
         if self.trainer_config.use_tfb:
             self.train_summary_writer = SummaryWriter(log_dir=self.base_config.specs['tfb_train_dir'])
             self.valid_summary_writer = SummaryWriter(log_dir=self.base_config.specs['tfb_valid_dir'])
+
+    def _get_optimizer_params(self):
+        if hasattr(self.model, "get_optimizer_param_groups"):
+            return self.model.get_optimizer_param_groups(
+                base_lr=self.learning_rate,
+                weight_decay=self.trainer_config.weight_decay,
+            )
+        return self.model.parameters()
+
+    def ensure_lr_scheduler(self, epoch_len):
+        if self.lr_scheduler is None and self.trainer_config.lr_scheduler:
+            self.lr_scheduler = get_lr_scheduler(
+                self.opt,
+                self.trainer_config,
+                epoch_len=epoch_len,
+            )
 
     def restore(self, ckpt_dir):
         """Load the checkpoint to restore the model.
@@ -126,6 +149,8 @@ class TorchModelWrapper:
                 self.opt.zero_grad()
                 (loss / num_event).backward()
                 self.opt.step()
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler.step()
             else:  # by default we do not do evaluation on train set which may take a long time
                 if self.model.event_sampler:
                     self.model.eval()

@@ -10,6 +10,7 @@ from easy_tpp.utils.misc import py_assert, make_config_string, create_folder, sa
 from easy_tpp.utils.multiprocess_utils import get_unique_id, Timer, parse_uri_to_protocol_and_path, is_master_process, \
     is_local_master_process
 from easy_tpp.utils.ode_utils import rk4_step_method
+from easy_tpp.utils.optim import get_lr_scheduler
 from easy_tpp.utils.registrable import Registrable
 from easy_tpp.utils.torch_utils import set_device, set_optimizer, set_seed, count_model_params
 from easy_tpp.utils.generic import is_torch_device, is_numpy_array
@@ -46,6 +47,7 @@ __all__ = ['py_assert',
            'dict_deep_update',
            'DefaultRunnerConfig',
            'rk4_step_method',
+           'get_lr_scheduler',
            'is_torchvision_available',
            'is_torch_cuda_available',
            'is_torch_gpu_available',

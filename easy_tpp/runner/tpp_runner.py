@@ -90,6 +90,8 @@ class TPPRunner(Runner):
             valid_loader (EasyTPP.DataLoader): data loader for the valid set.
         """
         test_loader = kwargs.get('test_loader')
+        if self.use_torch and self.runner_config.trainer_config.lr_scheduler:
+            self.model_wrapper.ensure_lr_scheduler(len(train_loader))
         for i in range(self.runner_config.trainer_config.max_epoch):
             train_metrics = self.run_one_epoch(train_loader, RunnerPhase.TRAIN)
 

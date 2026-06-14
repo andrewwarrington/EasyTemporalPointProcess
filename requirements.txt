@@ -6,3 +6,5 @@ tensorboard
 packaging
 datasets
 omegaconf
+matplotlib
+pytest

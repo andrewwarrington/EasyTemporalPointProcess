@@ -18,6 +18,10 @@ class TrainerConfig(Config):
         self.valid_freq = kwargs.get('valid_freq', 1)
         self.use_tfb = kwargs.get('use_tfb', False)
         self.metrics = kwargs.get('metrics', ['acc', 'rmse'])
+        self.lr_scheduler = kwargs.get('lr_scheduler', False)
+        self.weight_decay = kwargs.get('weight_decay', 0.0)
+        self.warmup_pct = kwargs.get('warmup_pct', 0.0)
+        self.lr_decay_style = kwargs.get('lr_decay_style', 'constant')
 
     def get_yaml_config(self):
         """Return the config in dict (yaml compatible) format.
@@ -34,7 +38,11 @@ class TrainerConfig(Config):
                 'learning_rate': self.learning_rate,
                 'valid_freq': self.valid_freq,
                 'use_tfb': self.use_tfb,
-                'metrics': self.metrics
+                'metrics': self.metrics,
+                'lr_scheduler': self.lr_scheduler,
+                'weight_decay': self.weight_decay,
+                'warmup_pct': self.warmup_pct,
+                'lr_decay_style': self.lr_decay_style,
                 }
 
     @staticmethod
@@ -62,7 +70,11 @@ class TrainerConfig(Config):
                              learning_rate=self.learning_rate,
                              valid_freq=self.valid_freq,
                              use_tfb=self.use_tfb,
-                             metrics=self.metrics
+                             metrics=self.metrics,
+                             lr_scheduler=self.lr_scheduler,
+                             weight_decay=self.weight_decay,
+                             warmup_pct=self.warmup_pct,
+                             lr_decay_style=self.lr_decay_style
                              )
 
 
