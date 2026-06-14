@@ -1,0 +1,198 @@
+pipeline_config_id: runner_config
+
+data:
+  taxi:
+    data_format: json
+    train_dir:  easytpp/taxi  # ./data/taxi/train.json
+    valid_dir:  easytpp/taxi # ./data/taxi/dev.json
+    test_dir:  easytpp/taxi # ./data/taxi/test.json
+    data_specs:
+      num_event_types: 10
+      pad_token_id: 10
+      padding_side: right
+#      padding_strategy: max_length
+#      truncation_strategy: longest_first # or Truncate to a maximum length specified with the argument `max_length`
+#      max_len: 20
+  conttime:
+    data_format: pkl
+    train_dir: ../data/conttime/train.pkl
+    valid_dir: ../data/conttime/dev.pkl
+    test_dir: ../data/conttime/test.pkl
+    data_specs:
+      num_event_types: 5
+      pad_token_id: 5
+      padding_side: right
+      truncation_side: right
+#      padding_strategy: max_length  # for ode tpp we have to set this to max_length
+#      max_len: 20
+  hawkes_1d:
+    data_format: pkl
+    train_dir: ../data/hawkes/train.pkl
+    valid_dir: ../data/hawkes/dev.pkl
+    test_dir: ../data/hawkes/test.pkl
+    data_specs:
+      num_event_types: 1
+      pad_token_id: 1
+      padding_side: right
+      truncation_side: right
+  retweet:
+    data_format: json
+    train_dir: easytpp/retweet
+    valid_dir: easytpp/retweet
+    test_dir: easytpp/retweet
+    data_specs:
+      num_event_types: 3
+      pad_token_id: 3
+      padding_side: right
+      truncation_side: right
+  stackoverflow:
+    data_format: json
+    train_dir: easytpp/stackoverflow
+    valid_dir: easytpp/stackoverflow
+    test_dir: easytpp/stackoverflow
+    data_specs:
+      num_event_types: 22
+      pad_token_id: 22
+      padding_side: right
+      truncation_side: right
+  taobao:
+    data_format: json
+    train_dir: easytpp/taobao
+    valid_dir: easytpp/taobao
+    test_dir: easytpp/taobao
+    data_specs:
+      num_event_types: 17
+      pad_token_id: 17
+      padding_side: right
+      truncation_side: right
+  amazon:
+    data_format: json
+    train_dir: easytpp/amazon
+    valid_dir: easytpp/amazon
+    test_dir: easytpp/amazon
+    data_specs:
+      num_event_types: 16
+      pad_token_id: 16
+      padding_side: right
+      truncation_side: right
+
+_common_trainer_config: &common_trainer_config
+  batch_size: 256
+  max_epoch: 300
+  shuffle: False
+  optimizer: adam
+  learning_rate: 1.e-3
+  valid_freq: 1
+  use_tfb: False
+  metrics: [ 'acc', 'rmse' ]
+  lr_scheduler: True
+  weight_decay: 1.e-5
+  warmup_pct: 0.01
+  lr_decay_style: cosine
+  seed: 2019
+  gpu: -1
+
+_common_thinning: &common_thinning
+  num_seq: 10
+  num_sample: 1
+  num_exp: 500
+  look_ahead_time: 10
+  patience_counter: 5
+  over_sample_rate: 5
+  num_samples_boundary: 5
+  dtime_max: 5
+
+_decoupled_model_config: &decoupled_model_config
+  hidden_size: 64
+  num_layers: 3
+  loss_integral_num_sample_per_step: 10
+  use_mc_samples: False
+  thinning: *common_thinning
+  model_specs:
+    ode_hidden_size: 128
+    num_ode_layers: 3
+    ode_steps: 16
+    ode_solver: euler
+    ode_dropout: 0.0
+    combine_mode: linear
+    intensity_floor: 1.e-8
+
+# Decoupled: Decoupled Marked Temporal Point Process Using Neural ODEs
+# Ref: Song et al., ICLR 2024
+# Aligned with the Decoupled blocks in HHP/EasyTPP/examples/configs.
+Decoupled_taxi_train:
+  base_config:
+    stage: train
+    backend: torch
+    dataset_id: taxi
+    runner_id: std_tpp
+    model_id: Decoupled
+    base_dir: './checkpoints/'
+  trainer_config: *common_trainer_config
+  model_config: *decoupled_model_config
+
+Decoupled_conttime_train:
+  base_config:
+    stage: train
+    backend: torch
+    dataset_id: conttime
+    runner_id: std_tpp
+    model_id: Decoupled
+    base_dir: './checkpoints/'
+  trainer_config: *common_trainer_config
+  model_config: *decoupled_model_config
+
+Decoupled_hawkes_1d_train:
+  base_config:
+    stage: train
+    backend: torch
+    dataset_id: hawkes_1d
+    runner_id: std_tpp
+    model_id: Decoupled
+    base_dir: './checkpoints/'
+  trainer_config: *common_trainer_config
+  model_config: *decoupled_model_config
+
+Decoupled_retweet_train:
+  base_config:
+    stage: train
+    backend: torch
+    dataset_id: retweet
+    runner_id: std_tpp
+    model_id: Decoupled
+    base_dir: './checkpoints/'
+  trainer_config: *common_trainer_config
+  model_config: *decoupled_model_config
+
+Decoupled_stackoverflow_train:
+  base_config:
+    stage: train
+    backend: torch
+    dataset_id: stackoverflow
+    runner_id: std_tpp
+    model_id: Decoupled
+    base_dir: './checkpoints/'
+  trainer_config: *common_trainer_config
+  model_config: *decoupled_model_config
+
+Decoupled_taobao_train:
+  base_config:
+    stage: train
+    backend: torch
+    dataset_id: taobao
+    runner_id: std_tpp
+    model_id: Decoupled
+    base_dir: './checkpoints/'
+  trainer_config: *common_trainer_config
+  model_config: *decoupled_model_config
+
+Decoupled_amazon_train:
+  base_config:
+    stage: train
+    backend: torch
+    dataset_id: amazon
+    runner_id: std_tpp
+    model_id: Decoupled
+    base_dir: './checkpoints/'
+  trainer_config: *common_trainer_config
+  model_config: *decoupled_model_config
