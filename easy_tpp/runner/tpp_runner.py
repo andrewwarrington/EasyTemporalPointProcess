@@ -29,6 +29,7 @@ class TPPRunner(Runner):
         self.use_torch = self.runner_config.base_config.backend == Backend.Torch
 
         if self.use_torch:
+            import easy_tpp.model  # noqa: F401
             from easy_tpp.utils import set_seed
             from easy_tpp.model.torch_model.torch_basemodel import TorchBaseModel
             from easy_tpp.torch_wrapper import TorchModelWrapper

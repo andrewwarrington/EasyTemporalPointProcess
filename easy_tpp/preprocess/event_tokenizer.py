@@ -421,6 +421,9 @@ class EventTokenizer:
         else:
             batch_output[self.model_input_names[4]] = []
 
+        batch_marks = batch_output[self.model_input_names[2]]
+        batch_marks[batch_marks == -1] = self.pad_token_id
+        batch_output[self.model_input_names[2]] = batch_marks
         return batch_output
 
     @staticmethod
