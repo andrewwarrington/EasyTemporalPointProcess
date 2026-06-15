@@ -105,17 +105,12 @@ _common_thinning: &common_thinning
 _decoupled_model_config: &decoupled_model_config
   hidden_size: 64
   num_layers: 3
-  loss_integral_num_sample_per_step: 10
-  use_mc_samples: False
   thinning: *common_thinning
   model_specs:
     ode_hidden_size: 128
     num_ode_layers: 3
     ode_steps: 16
     ode_solver: euler
-    ode_dropout: 0.0
-    combine_mode: linear
-    intensity_floor: 1.e-8
 
 # Decoupled: Decoupled Marked Temporal Point Process Using Neural ODEs
 # Ref: Song et al., ICLR 2024

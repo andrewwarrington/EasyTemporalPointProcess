@@ -659,7 +659,7 @@ class NJDTPP(TorchBaseModel):
             seq_mask=seq_mask,
         )
 
-        if compute_last_step_only:
+        if compute_last_step_only or sample_dtimes.size(1) == 1:
             right_states = right_states[:, -1:, :]
             sample_dtimes = sample_dtimes[:, -1:, :]
 

@@ -12,8 +12,6 @@ Common hyperparameter ranges reported or used by the paper:
     - ``model_specs.num_ode_layers``: 3, 4, or 5.
     - ``model_specs.ode_steps``: 16 during training and 64 during testing.
     - ``model_specs.ode_solver``: ``euler`` for speed or ``rk4`` for accuracy.
-    - ``model_specs.combine_mode``: ``linear`` for the main paper baseline;
-      ``nonlinear`` for the appendix variant with inhibitory effects.
 """
 
 from __future__ import annotations
@@ -36,7 +34,6 @@ class _InfluenceODE(nn.Module):
         mark_emb_size: int,
         ode_hidden_size: int,
         num_ode_layers: int,
-        dropout_rate: float,
     ) -> None:
         """Initialize the ODE vector field.
 
@@ -45,7 +42,6 @@ class _InfluenceODE(nn.Module):
             mark_emb_size: Dimension of the event mark context embedding.
             ode_hidden_size: Width of hidden MLP layers.
             num_ode_layers: Number of hidden MLP layers before the output.
-            dropout_rate: Dropout probability between hidden layers.
         """
         super().__init__()
         if num_ode_layers < 1:
@@ -64,8 +60,6 @@ class _InfluenceODE(nn.Module):
                 ),
             )
             layers.append(nn.Tanh())
-            if dropout_rate > 0.0:
-                layers.append(nn.Dropout(dropout_rate))
         layers.append(nn.Linear(ode_hidden_size, hidden_size))
         self.network = nn.Sequential(*layers)
 
@@ -104,19 +98,14 @@ class Decoupled(TorchBaseModel):
         super().__init__(model_config)
         specs = model_config.model_specs
         self.ode_steps = int(specs.get("ode_steps", 16))
-        self.combine_mode = specs.get("combine_mode", "linear").lower()
-        self.intensity_floor = float(specs.get("intensity_floor", 1e-8))
 
         solver_name = specs.get("ode_solver", "euler").lower()
         if solver_name not in {"euler", "rk4"}:
             raise ValueError("Decoupled ode_solver must be 'euler' or 'rk4'")
         self.solver_name = solver_name
-        if self.combine_mode not in {"linear", "nonlinear"}:
-            raise ValueError("Decoupled combine_mode must be 'linear' or 'nonlinear'")
 
         ode_hidden_size = int(specs.get("ode_hidden_size", 256))
         num_ode_layers = int(specs.get("num_ode_layers", 3))
-        ode_dropout = float(specs.get("ode_dropout", model_config.dropout_rate))
 
         # W_e(k) in Eq. (6): initial state for the influence created by mark k.
         self.event_state_emb = nn.Embedding(
@@ -136,15 +125,9 @@ class Decoupled(TorchBaseModel):
             mark_emb_size=self.hidden_size,
             ode_hidden_size=ode_hidden_size,
             num_ode_layers=num_ode_layers,
-            dropout_rate=ode_dropout,
         )
         self.ground_head = nn.Linear(self.hidden_size, 1)
         self.mark_head = nn.Linear(self.hidden_size, self.num_event_types)
-
-        # A learned background keeps lambda positive before any non-padding
-        # history exists, which matters for datasets with a left-window pad mark.
-        self.background_ground = nn.Parameter(torch.zeros(1))
-        self.background_mark_logits = nn.Parameter(torch.zeros(self.num_event_types))
 
     def _valid_event_mask(
         self,
@@ -210,6 +193,79 @@ class Decoupled(TorchBaseModel):
             current_time = current_time + step_dt
         return state
 
+    def _linear_ground_contribution(self, state: torch.Tensor) -> torch.Tensor:
+        """Return the non-negative per-event ground contribution."""
+        return F.softplus(self.ground_head(state).squeeze(-1))
+
+    def _ode_step_with_ground_integral(
+        self,
+        state: torch.Tensor,
+        mark_embedding: torch.Tensor,
+        current_time: torch.Tensor,
+        step_dt: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Advance the influence ODE and its linear ground compensator."""
+        step_width = step_dt.squeeze(-1)
+        if self.solver_name == "euler":
+            derivative = self.ode_func(state, mark_embedding, current_time)
+            ground = self._linear_ground_contribution(state)
+            return state + step_dt * derivative, step_width * ground
+
+        half_dt = step_dt / 2.0
+        k1 = self.ode_func(state, mark_embedding, current_time)
+        g1 = self._linear_ground_contribution(state)
+
+        state_2 = state + half_dt * k1
+        k2 = self.ode_func(state_2, mark_embedding, current_time + half_dt)
+        g2 = self._linear_ground_contribution(state_2)
+
+        state_3 = state + half_dt * k2
+        k3 = self.ode_func(state_3, mark_embedding, current_time + half_dt)
+        g3 = self._linear_ground_contribution(state_3)
+
+        state_4 = state + step_dt * k3
+        k4 = self.ode_func(state_4, mark_embedding, current_time + step_dt)
+        g4 = self._linear_ground_contribution(state_4)
+
+        next_state = state + step_dt * (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
+        ground_integral = step_width * (g1 + 2.0 * g2 + 2.0 * g3 + g4) / 6.0
+        return next_state, ground_integral
+
+    def _integrate_influences_and_compensator(
+        self,
+        initial_state: torch.Tensor,
+        mark_embedding: torch.Tensor,
+        delta_time: torch.Tensor,
+        start_time: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Propagate states while integrating linear ground contributions."""
+        solver_steps = max(self.ode_steps, 1)
+        step_dt = (delta_time.clamp_min(0.0) / solver_steps).unsqueeze(-1)
+        current_time = start_time.clamp_min(0.0).unsqueeze(-1) + torch.zeros_like(
+            step_dt,
+        )
+        broadcast_base = torch.zeros(
+            *step_dt.shape[:-1],
+            self.hidden_size,
+            device=initial_state.device,
+            dtype=initial_state.dtype,
+        )
+        state = initial_state + broadcast_base
+        mark_embedding = mark_embedding + broadcast_base
+        compensator = torch.zeros_like(delta_time, dtype=initial_state.dtype)
+
+        for _ in range(solver_steps):
+            state, increment = self._ode_step_with_ground_integral(
+                state=state,
+                mark_embedding=mark_embedding,
+                current_time=current_time,
+                step_dt=step_dt,
+            )
+            compensator = compensator + increment
+            current_time = current_time + step_dt
+
+        return state, compensator
+
     def _ode_step(
         self,
         state: torch.Tensor,
@@ -257,21 +313,14 @@ class Decoupled(TorchBaseModel):
             Marked intensities, shape ``[..., num_event_types]``.
         """
         mask = source_mask.to(influence_states.dtype).unsqueeze(-1)
-        raw_ground = self.ground_head(influence_states).squeeze(-1)
         mark_logits = self.mark_head(influence_states) * mask
 
-        if self.combine_mode == "linear":
-            # Main-paper Dec-ODE: every event contributes a non-negative scalar.
-            ground = F.softplus(raw_ground) * source_mask.to(raw_ground.dtype)
-            ground = ground.sum(dim=-1) + F.softplus(self.background_ground)
-        else:
-            # Appendix A.1: summing before softplus allows inhibitory effects.
-            raw_sum = (raw_ground * source_mask.to(raw_ground.dtype)).sum(dim=-1)
-            ground = F.softplus(raw_sum + self.background_ground)
-
-        mark_logits = mark_logits.sum(dim=-2) + self.background_mark_logits
+        ground = self._linear_ground_contribution(influence_states)
+        ground = ground * source_mask.to(ground.dtype)
+        ground = ground.sum(dim=-1)
+        mark_logits = mark_logits.sum(dim=-2)
         mark_probs = torch.softmax(mark_logits, dim=-1)
-        return ground.clamp_min(self.intensity_floor).unsqueeze(-1) * mark_probs
+        return ground.clamp_min(self.eps).unsqueeze(-1) * mark_probs
 
     def _intensity_at_event_positions(
         self,
@@ -312,6 +361,68 @@ class Decoupled(TorchBaseModel):
             )
         return torch.stack(intensities, dim=1)
 
+    def _linear_ground_compensator(
+        self,
+        time_seqs: torch.Tensor,
+        type_seqs: torch.Tensor,
+        seq_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Integrate the linear Dec-ODE ground intensity per interval."""
+        source_states = self.event_state_emb(type_seqs)
+        source_marks = self.mark_context_emb(type_seqs)
+        valid_sources = self._valid_event_mask(type_seqs, seq_mask)
+        interval_compensators = []
+
+        for target_index in range(1, time_seqs.size(1)):
+            source_slice = slice(0, target_index)
+            source_times = time_seqs[:, source_slice]
+            previous_time = time_seqs[:, target_index - 1, None]
+            target_time = time_seqs[:, target_index, None]
+            source_state_slice = source_states[:, source_slice, :]
+            source_mark_slice = source_marks[:, source_slice, :]
+
+            state_at_previous, _ = self._integrate_influences_and_compensator(
+                initial_state=source_state_slice,
+                mark_embedding=source_mark_slice,
+                delta_time=(previous_time - source_times).clamp_min(0.0),
+                start_time=source_times,
+            )
+
+            interval_delta = (target_time - previous_time).clamp_min(0.0)
+            _, source_compensator = self._integrate_influences_and_compensator(
+                initial_state=state_at_previous,
+                mark_embedding=source_mark_slice,
+                delta_time=interval_delta.expand_as(source_times),
+                start_time=previous_time.expand_as(source_times),
+            )
+            source_compensator = source_compensator * valid_sources[
+                :,
+                source_slice,
+            ].to(source_compensator.dtype)
+            interval_compensator = source_compensator.sum(dim=-1)
+            interval_compensators.append(interval_compensator)
+
+        return torch.stack(interval_compensators, dim=1)
+
+    def _event_loglikelihood(
+        self,
+        lambda_at_event: torch.Tensor,
+        type_seqs: torch.Tensor,
+        seq_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, int]:
+        """Gather marked event intensities for targets t_1 ... t_N."""
+        target_types = type_seqs[:, 1:]
+        target_mask = seq_mask[:, 1:].bool() & target_types.lt(self.num_event_types)
+        safe_target_types = target_types.clamp(min=0, max=self.num_event_types - 1)
+        marked_intensities = torch.gather(
+            lambda_at_event,
+            dim=-1,
+            index=safe_target_types.unsqueeze(-1),
+        ).squeeze(-1)
+        event_ll = marked_intensities.clamp_min(self.eps).log()
+        event_ll = event_ll * target_mask.to(event_ll.dtype)
+        return event_ll, int(target_mask.sum().item())
+
     def loglike_loss(
         self,
         batch: Tuple[torch.Tensor, ...],
@@ -327,26 +438,24 @@ class Decoupled(TorchBaseModel):
         Returns:
             Tuple of total loss and number of events.
         """
-        time_seqs, time_delta_seqs, type_seqs, batch_non_pad_mask, _ = batch
+        time_seqs, _, type_seqs, batch_non_pad_mask, _ = batch
         lambda_at_event = self._intensity_at_event_positions(
             time_seqs=time_seqs,
             type_seqs=type_seqs,
             seq_mask=batch_non_pad_mask,
         )
-        sample_dtimes = self.make_dtime_loss_samples(time_delta_seqs[:, 1:])
-        lambda_t_sample = self.compute_intensities_at_sample_times(
-            time_seqs=time_seqs[:, :-1],
-            time_delta_seqs=time_delta_seqs[:, :-1],
-            type_seqs=type_seqs[:, :-1],
-            sample_dtimes=sample_dtimes,
-        )
-
-        event_ll, non_event_ll, num_events = self.compute_loglikelihood(
-            time_delta_seq=time_delta_seqs[:, 1:],
+        event_ll, num_events = self._event_loglikelihood(
             lambda_at_event=lambda_at_event,
-            lambdas_loss_samples=lambda_t_sample,
-            seq_mask=batch_non_pad_mask[:, 1:],
-            type_seq=type_seqs[:, 1:],
+            type_seqs=type_seqs,
+            seq_mask=batch_non_pad_mask,
+        )
+        non_event_ll = self._linear_ground_compensator(
+            time_seqs=time_seqs,
+            type_seqs=type_seqs,
+            seq_mask=batch_non_pad_mask,
+        )
+        non_event_ll = non_event_ll * batch_non_pad_mask[:, 1:].to(
+            non_event_ll.dtype,
         )
         loss = -(event_ll - non_event_ll).sum()
         return loss, num_events
@@ -375,7 +484,7 @@ class Decoupled(TorchBaseModel):
         """
         del time_delta_seqs
         compute_last_step_only = kwargs.get("compute_last_step_only", False)
-        if compute_last_step_only:
+        if compute_last_step_only or sample_dtimes.size(1) == 1:
             target_indices = [time_seqs.size(1) - 1]
             sample_dtimes = sample_dtimes[:, -1:, :]
         else:
