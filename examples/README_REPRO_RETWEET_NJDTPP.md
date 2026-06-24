@@ -6,6 +6,8 @@ Run the paper/source default directly through EasyTPP:
 ./examples/run_retweet_njdtpp_paper_default.sh
 ```
 
+This script uses `examples/configs/train_retweet_njdtpp_paper_default.yaml`.
+
 For a short timing check, use the optional grid runner with one trial and one
 epoch:
 

@@ -142,7 +142,11 @@ def infer_experiment_id(config: dict[str, Any], requested: str | None) -> str:
     """
     if requested:
         return requested
-    ids = [key for key in config if key not in {"pipeline_config_id", "data"}]
+    ids = [
+        key
+        for key in config
+        if key not in {"pipeline_config_id", "data"} and not key.startswith("_")
+    ]
     if len(ids) != 1:
         raise ValueError("Pass --experiment_id when a config has multiple experiments.")
     return ids[0]

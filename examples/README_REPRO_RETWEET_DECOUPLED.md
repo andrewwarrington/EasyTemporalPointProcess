@@ -6,6 +6,8 @@ Run the paper default directly through EasyTPP:
 ./examples/run_retweet_decoupled_paper_default.sh
 ```
 
+This script uses `examples/configs/train_retweet_decoupled_paper_default.yaml`.
+
 For a short timing check, temporarily lower `trainer_config.max_epoch` in the
 YAML or use the optional grid runner override.
 
