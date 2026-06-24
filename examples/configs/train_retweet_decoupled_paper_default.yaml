@@ -1,0 +1,54 @@
+pipeline_config_id: runner_config
+
+data:
+  retweet:
+    data_format: json
+    train_dir: easytpp/retweet
+    valid_dir: easytpp/retweet
+    test_dir: easytpp/retweet
+    data_specs:
+      num_event_types: 3
+      pad_token_id: 3
+      padding_side: right
+      truncation_side: right
+
+Decoupled_retweet_paper_default:
+  base_config:
+    stage: train
+    backend: torch
+    dataset_id: retweet
+    runner_id: std_tpp
+    model_id: Decoupled
+    base_dir: './checkpoints/retweet_decoupled_paper_default/'
+    specs:
+      paper: "Song et al. 2024, Decoupled Marked Temporal Point Process using Neural ODEs"
+      source: "https://arxiv.org/abs/2406.06149"
+      note: "Appendix B.5-style default: D=64, N=256, L=3, Euler, 16 training IVP steps."
+  trainer_config:
+    batch_size: 30
+    max_epoch: 5
+    shuffle: false
+    optimizer: adam
+    learning_rate: 1.0e-3
+    valid_freq: 1
+    use_tfb: false
+    metrics: ['acc', 'rmse']
+    seed: 2019
+    gpu: -1
+    lr_scheduler: true
+    weight_decay: 1.0e-5
+    warmup_pct: 0.01
+    lr_decay_style: cosine
+  model_config:
+    hidden_size: 64
+    num_layers: 3
+    loss_integral_num_sample_per_step: 10
+    use_mc_samples: false
+    model_specs:
+      ode_hidden_size: 256
+      num_ode_layers: 3
+      ode_steps: 16
+      ode_solver: euler
+      ode_dropout: 0.0
+      combine_mode: linear
+      intensity_floor: 1.0e-8
