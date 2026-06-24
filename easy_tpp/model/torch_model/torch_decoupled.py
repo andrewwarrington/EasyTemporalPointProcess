@@ -10,8 +10,10 @@ Common hyperparameter ranges reported or used by the paper:
     - ``hidden_size``: 32 or 64 for each event influence state.
     - ``model_specs.ode_hidden_size``: 128 or 256 for the ODE network width.
     - ``model_specs.num_ode_layers``: 3, 4, or 5.
-    - ``model_specs.ode_steps``: 16 during training and 64 during testing.
-    - ``model_specs.ode_solver``: ``euler`` for speed or ``rk4`` for accuracy.
+    - ``model_specs.ode_steps``: 16 during training.
+    - ``model_specs.eval_ode_steps``: 64 during validation/testing.
+    - ``model_specs.ode_solver``: ``euler`` for training.
+    - ``model_specs.eval_ode_solver``: ``rk4`` for validation/testing.
 """
 
 from __future__ import annotations
@@ -98,11 +100,16 @@ class Decoupled(TorchBaseModel):
         super().__init__(model_config)
         specs = model_config.model_specs
         self.ode_steps = int(specs.get("ode_steps", 16))
+        self.eval_ode_steps = int(specs.get("eval_ode_steps", self.ode_steps))
 
         solver_name = specs.get("ode_solver", "euler").lower()
         if solver_name not in {"euler", "rk4"}:
             raise ValueError("Decoupled ode_solver must be 'euler' or 'rk4'")
         self.solver_name = solver_name
+        eval_solver_name = specs.get("eval_ode_solver", solver_name).lower()
+        if eval_solver_name not in {"euler", "rk4"}:
+            raise ValueError("Decoupled eval_ode_solver must be 'euler' or 'rk4'")
+        self.eval_solver_name = eval_solver_name
 
         ode_hidden_size = int(specs.get("ode_hidden_size", 256))
         num_ode_layers = int(specs.get("num_ode_layers", 3))
@@ -128,6 +135,14 @@ class Decoupled(TorchBaseModel):
         )
         self.ground_head = nn.Linear(self.hidden_size, 1)
         self.mark_head = nn.Linear(self.hidden_size, self.num_event_types)
+
+    def _active_ode_steps(self) -> int:
+        """Return the train or eval solver step count."""
+        return self.ode_steps if self.training else self.eval_ode_steps
+
+    def _active_solver_name(self) -> str:
+        """Return the train or eval solver name."""
+        return self.solver_name if self.training else self.eval_solver_name
 
     def _valid_event_mask(
         self,
@@ -169,7 +184,7 @@ class Decoupled(TorchBaseModel):
         Returns:
             Propagated states with shape ``[..., hidden_size]``.
         """
-        solver_steps = max(self.ode_steps, 1)
+        solver_steps = max(self._active_ode_steps(), 1)
         step_dt = (delta_time.clamp_min(0.0) / solver_steps).unsqueeze(-1)
         current_time = start_time.clamp_min(0.0).unsqueeze(-1) + torch.zeros_like(
             step_dt,
@@ -206,7 +221,7 @@ class Decoupled(TorchBaseModel):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Advance the influence ODE and its linear ground compensator."""
         step_width = step_dt.squeeze(-1)
-        if self.solver_name == "euler":
+        if self._active_solver_name() == "euler":
             derivative = self.ode_func(state, mark_embedding, current_time)
             ground = self._linear_ground_contribution(state)
             return state + step_dt * derivative, step_width * ground
@@ -239,7 +254,7 @@ class Decoupled(TorchBaseModel):
         start_time: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Propagate states while integrating linear ground contributions."""
-        solver_steps = max(self.ode_steps, 1)
+        solver_steps = max(self._active_ode_steps(), 1)
         step_dt = (delta_time.clamp_min(0.0) / solver_steps).unsqueeze(-1)
         current_time = start_time.clamp_min(0.0).unsqueeze(-1) + torch.zeros_like(
             step_dt,
@@ -274,7 +289,7 @@ class Decoupled(TorchBaseModel):
         step_dt: torch.Tensor,
     ) -> torch.Tensor:
         """Take one time-aware Euler or RK4 step for Dec-ODE influences."""
-        if self.solver_name == "euler":
+        if self._active_solver_name() == "euler":
             derivative = self.ode_func(state, mark_embedding, current_time)
             return state + step_dt * derivative
 

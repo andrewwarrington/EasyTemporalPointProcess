@@ -131,6 +131,10 @@ class NJDTPP(TorchBaseModel):
         self.num_sde_steps = int(specs.get("num_sde_steps", 10))
         self.num_prediction_samples = int(specs.get("num_prediction_samples", 1000))
         self.diffusion_scale = float(specs.get("diffusion_scale", 1.0))
+        eval_diffusion_scale = specs.get("eval_diffusion_scale")
+        self.eval_diffusion_scale = (
+            None if eval_diffusion_scale is None else float(eval_diffusion_scale)
+        )
         self.log_intensity_clip = float(specs.get("log_intensity_clip", 20.0))
         self.eta0_learning_rate = float(specs.get("eta0_learning_rate", 1.0e-1))
         # eta0 is learned directly, as in the released NJDTPP implementation.
@@ -184,6 +188,8 @@ class NJDTPP(TorchBaseModel):
 
     def _noise_scale(self) -> float:
         """Return the Brownian noise scale."""
+        if not self.training and self.eval_diffusion_scale is not None:
+            return self.eval_diffusion_scale
         return self.diffusion_scale
 
     def _apply_jump(

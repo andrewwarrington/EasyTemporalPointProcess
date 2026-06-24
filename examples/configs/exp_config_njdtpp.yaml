@@ -1,45 +1,31 @@
 pipeline_config_id: runner_config
 
 data:
-  taxi:
+  lastfm:
     data_format: json
-    train_dir:  easytpp/taxi  # ./data/taxi/train.json
-    valid_dir:  easytpp/taxi # ./data/taxi/dev.json
-    test_dir:  easytpp/taxi # ./data/taxi/test.json
+    train_dir: examples/data/lastfm_json/train.json
+    valid_dir: examples/data/lastfm_json/dev.json
+    test_dir: examples/data/lastfm_json/test.json
     data_specs:
-      num_event_types: 10
-      pad_token_id: 10
-      padding_side: right
-#      padding_strategy: max_length
-#      truncation_strategy: longest_first # or Truncate to a maximum length specified with the argument `max_length`
-#      max_len: 20
-  conttime:
-    data_format: pkl
-    train_dir: ../data/conttime/train.pkl
-    valid_dir: ../data/conttime/dev.pkl
-    test_dir: ../data/conttime/test.pkl
-    data_specs:
-      num_event_types: 5
-      pad_token_id: 5
+      num_event_types: 120
+      pad_token_id: 120
       padding_side: right
       truncation_side: right
-#      padding_strategy: max_length  # for ode tpp we have to set this to max_length
-#      max_len: 20
-  hawkes_1d:
-    data_format: pkl
-    train_dir: ../data/hawkes/train.pkl
-    valid_dir: ../data/hawkes/dev.pkl
-    test_dir: ../data/hawkes/test.pkl
+  mimicii_jitter:
+    data_format: json
+    train_dir: examples/data/mimicii_jitter/train_jitter.json
+    valid_dir: examples/data/mimicii_jitter/dev_jitter.json
+    test_dir: examples/data/mimicii_jitter/test_jitter.json
     data_specs:
-      num_event_types: 1
-      pad_token_id: 1
+      num_event_types: 75
+      pad_token_id: 75
       padding_side: right
       truncation_side: right
-  retweet:
+  retweet_jitter:
     data_format: json
-    train_dir: easytpp/retweet
-    valid_dir: easytpp/retweet
-    test_dir: easytpp/retweet
+    train_dir: examples/data/retweet_jitter/train_jitter.json
+    valid_dir: examples/data/retweet_jitter/dev_jitter.json
+    test_dir: examples/data/retweet_jitter/test_jitter.json
     data_specs:
       num_event_types: 3
       pad_token_id: 3
@@ -47,39 +33,21 @@ data:
       truncation_side: right
   stackoverflow:
     data_format: json
-    train_dir: easytpp/stackoverflow
-    valid_dir: easytpp/stackoverflow
-    test_dir: easytpp/stackoverflow
+    train_dir: examples/data/stackoverflow_json/train.json
+    valid_dir: examples/data/stackoverflow_json/dev.json
+    test_dir: examples/data/stackoverflow_json/test.json
     data_specs:
       num_event_types: 22
       pad_token_id: 22
       padding_side: right
       truncation_side: right
-  taobao:
-    data_format: json
-    train_dir: easytpp/taobao
-    valid_dir: easytpp/taobao
-    test_dir: easytpp/taobao
-    data_specs:
-      num_event_types: 17
-      pad_token_id: 17
-      padding_side: right
-      truncation_side: right
-  amazon:
-    data_format: json
-    train_dir: easytpp/amazon
-    valid_dir: easytpp/amazon
-    test_dir: easytpp/amazon
-    data_specs:
-      num_event_types: 16
-      pad_token_id: 16
-      padding_side: right
-      truncation_side: right
 
 _common_trainer_config: &common_trainer_config
-  batch_size: 256
-  max_epoch: 300
-  shuffle: False
+  # The released NJDTPP scripts train with 3000 random minibatch iterations.
+  # EasyTPP is epoch-based, so max_epoch is the practical run budget here.
+  batch_size: 30
+  max_epoch: 10
+  shuffle: True
   optimizer: adam
   learning_rate: 1.e-3
   valid_freq: 1
@@ -89,7 +57,7 @@ _common_trainer_config: &common_trainer_config
   weight_decay: 1.e-5
   warmup_pct: 0.01
   lr_decay_style: cosine
-  seed: 2019
+  seed: 42
   gpu: -1
 
 _common_thinning: &common_thinning
@@ -103,9 +71,13 @@ _common_thinning: &common_thinning
   dtime_max: 5
 
 _njdtpp_model_config: &njdtpp_model_config
+  # Paper/code defaults: hidden=32, hidden layers=2, tanh activation,
+  # Euler-Maruyama num_divide=10, init std=0.01, eta0 std=0.1.
   hidden_size: 32
   num_layers: 2
-  loss_integral_num_sample_per_step: 10
+  # EasyTPP counts both interval endpoints; the released code uses 10
+  # sub-intervals and therefore records 11 states for likelihood integration.
+  loss_integral_num_sample_per_step: 11
   use_mc_samples: False
   thinning: *common_thinning
   model_specs:
@@ -118,49 +90,39 @@ _njdtpp_model_config: &njdtpp_model_config
     eta0_init_std: 0.1
     eta0_learning_rate: 1.e-1
     diffusion_scale: 1.0
+    eval_diffusion_scale: 0.0
     log_intensity_clip: 20.0
 
 # NJDTPP: Neural Jump-Diffusion Temporal Point Process
 # Ref: Zhang et al., ICML 2024
-# Aligned with the NJDTPP blocks in HHP/EasyTPP/examples/configs.
-NJDTPP_taxi_train:
+# Model defaults mirror the authors' released reproduction scripts.
+NJDTPP_lastfm_train:
   base_config:
     stage: train
     backend: torch
-    dataset_id: taxi
+    dataset_id: lastfm
     runner_id: std_tpp
     model_id: NJDTPP
     base_dir: './checkpoints/'
   trainer_config: *common_trainer_config
   model_config: *njdtpp_model_config
 
-NJDTPP_conttime_train:
+NJDTPP_mimicii_jitter_train:
   base_config:
     stage: train
     backend: torch
-    dataset_id: conttime
+    dataset_id: mimicii_jitter
     runner_id: std_tpp
     model_id: NJDTPP
     base_dir: './checkpoints/'
   trainer_config: *common_trainer_config
   model_config: *njdtpp_model_config
 
-NJDTPP_hawkes_1d_train:
+NJDTPP_retweet_jitter_train:
   base_config:
     stage: train
     backend: torch
-    dataset_id: hawkes_1d
-    runner_id: std_tpp
-    model_id: NJDTPP
-    base_dir: './checkpoints/'
-  trainer_config: *common_trainer_config
-  model_config: *njdtpp_model_config
-
-NJDTPP_retweet_train:
-  base_config:
-    stage: train
-    backend: torch
-    dataset_id: retweet
+    dataset_id: retweet_jitter
     runner_id: std_tpp
     model_id: NJDTPP
     base_dir: './checkpoints/'
@@ -172,28 +134,6 @@ NJDTPP_stackoverflow_train:
     stage: train
     backend: torch
     dataset_id: stackoverflow
-    runner_id: std_tpp
-    model_id: NJDTPP
-    base_dir: './checkpoints/'
-  trainer_config: *common_trainer_config
-  model_config: *njdtpp_model_config
-
-NJDTPP_taobao_train:
-  base_config:
-    stage: train
-    backend: torch
-    dataset_id: taobao
-    runner_id: std_tpp
-    model_id: NJDTPP
-    base_dir: './checkpoints/'
-  trainer_config: *common_trainer_config
-  model_config: *njdtpp_model_config
-
-NJDTPP_amazon_train:
-  base_config:
-    stage: train
-    backend: torch
-    dataset_id: amazon
     runner_id: std_tpp
     model_id: NJDTPP
     base_dir: './checkpoints/'

@@ -1,6 +1,0 @@
-grid:
-  hidden_size: [32, 64]
-  model_specs.ode_hidden_size: [128, 256]
-  model_specs.num_ode_layers: [3, 4]
-  model_specs.ode_steps: [16, 32]
-  trainer_config.learning_rate: [1.0e-3, 3.0e-4]

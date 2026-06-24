@@ -1,5 +1,0 @@
-grid:
-  model_specs.hidden_size: [16, 32, 64]
-  model_specs.num_hidden_layers: [2, 3]
-  model_specs.num_sde_steps: [10, 20]
-  trainer_config.learning_rate: [1.0e-3, 3.0e-4]
